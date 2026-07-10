@@ -74,13 +74,30 @@ func (s *ollamaModelScheduler) Release(ctx context.Context) {
 	s.lastTouched = time.Time{}
 }
 
+// localEmbedStyle selects which HTTP embedding API to use for a given base URL
+// when EmbeddingProvider is "ollama" (local server slot).
+type localEmbedStyle string
+
+const (
+	localEmbedOllamaAPI   localEmbedStyle = "ollama_api_embed"    // POST /api/embed
+	localEmbedOpenAIV1    localEmbedStyle = "openai_v1"           // POST /v1/embeddings (llama.cpp server, etc.)
+	localEmbedOpenAIPlain localEmbedStyle = "openai_embeddings"   // POST /embeddings
+	localEmbedLlamaNative localEmbedStyle = "llamacpp_embedding"  // POST /embedding {"content":...}
+)
+
 type Client struct {
 	httpClient *http.Client
+
+	// Cache successful local embedding endpoint style per base URL so we don't
+	// re-probe Ollama-only routes on every batch when talking to llama.cpp.
+	localEmbedMu     sync.Mutex
+	localEmbedStyles map[string]localEmbedStyle
 }
 
 func NewClient() *Client {
 	return &Client{
-		httpClient: &http.Client{Timeout: 45 * time.Second},
+		httpClient:       &http.Client{Timeout: 120 * time.Second},
+		localEmbedStyles: make(map[string]localEmbedStyle),
 	}
 }
 
@@ -171,6 +188,8 @@ func (c *Client) embedBatch(ctx context.Context, cfg conf.SemanticConfig, inputs
 }
 
 func (c *Client) embedOllama(ctx context.Context, cfg conf.SemanticConfig, inputs []string) ([][]float64, error) {
+	// "ollama" provider is the local embedding slot: Ollama by default, but also
+	// OpenAI-compatible / llama.cpp servers that share OllamaBaseURL.
 	base := strings.TrimRight(strings.TrimSpace(cfg.OllamaBaseURL), "/")
 	if base == "" {
 		base = conf.DefaultOllamaBaseURL
@@ -183,31 +202,173 @@ func (c *Client) embedOllama(ctx context.Context, cfg conf.SemanticConfig, input
 		if end > len(inputs) {
 			end = len(inputs)
 		}
-		payload := map[string]any{
-			"model":      cfg.EmbeddingModel,
-			"input":      inputs[i:end],
-			"keep_alive": "30s",
-		}
-		var resp struct {
-			Embeddings [][]float64 `json:"embeddings"`
-			Embedding  []float64   `json:"embedding"`
-			Error      string      `json:"error"`
-			Data       []struct {
-				Embedding []float64 `json:"embedding"`
-				Index     int       `json:"index"`
-			} `json:"data"`
-		}
-		if err := c.doJSONNoAuth(ctx, base+"/api/embed", payload, &resp); err != nil {
-			return nil, err
-		}
-		if resp.Error != "" {
-			return nil, fmt.Errorf("ollama embedding error: %s", resp.Error)
-		}
-		vecs, err := normalizeEmbeddingResponse(resp.Embeddings, resp.Embedding, resp.Data, len(inputs[i:end]))
+		vecs, err := c.embedLocalBatch(ctx, base, cfg.EmbeddingModel, inputs[i:end])
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, vecs...)
+	}
+	return out, nil
+}
+
+func (c *Client) getLocalEmbedStyle(base string) (localEmbedStyle, bool) {
+	c.localEmbedMu.Lock()
+	defer c.localEmbedMu.Unlock()
+	if c.localEmbedStyles == nil {
+		return "", false
+	}
+	s, ok := c.localEmbedStyles[base]
+	return s, ok
+}
+
+func (c *Client) setLocalEmbedStyle(base string, style localEmbedStyle) {
+	c.localEmbedMu.Lock()
+	defer c.localEmbedMu.Unlock()
+	if c.localEmbedStyles == nil {
+		c.localEmbedStyles = make(map[string]localEmbedStyle)
+	}
+	c.localEmbedStyles[base] = style
+}
+
+func (c *Client) embedLocalBatch(ctx context.Context, base, model string, inputs []string) ([][]float64, error) {
+	if len(inputs) == 0 {
+		return nil, nil
+	}
+	if style, ok := c.getLocalEmbedStyle(base); ok {
+		vecs, err := c.embedLocalWithStyle(ctx, base, model, inputs, style)
+		if err == nil {
+			return vecs, nil
+		}
+		// Cached style failed (server swapped?): clear and re-probe.
+		c.localEmbedMu.Lock()
+		delete(c.localEmbedStyles, base)
+		c.localEmbedMu.Unlock()
+	}
+
+	type attempt struct {
+		style localEmbedStyle
+	}
+	// Prefer Ollama private API first (project default), then llama.cpp / OpenAI-compatible routes.
+	order := []attempt{
+		{localEmbedOllamaAPI},
+		{localEmbedOpenAIV1},
+		{localEmbedOpenAIPlain},
+		{localEmbedLlamaNative},
+	}
+	var errs []string
+	for _, a := range order {
+		vecs, err := c.embedLocalWithStyle(ctx, base, model, inputs, a.style)
+		if err == nil {
+			c.setLocalEmbedStyle(base, a.style)
+			return vecs, nil
+		}
+		errs = append(errs, fmt.Sprintf("%s: %v", a.style, err))
+		// Continue probing on typical "wrong server" failures; stop on context cancel.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	return nil, fmt.Errorf(
+		"local embedding failed for %s (tried Ollama /api/embed and llama.cpp OpenAI-compatible endpoints): %s",
+		base, strings.Join(errs, " | "),
+	)
+}
+
+func (c *Client) embedLocalWithStyle(ctx context.Context, base, model string, inputs []string, style localEmbedStyle) ([][]float64, error) {
+	switch style {
+	case localEmbedOllamaAPI:
+		return c.embedViaOllamaAPI(ctx, base, model, inputs)
+	case localEmbedOpenAIV1:
+		return c.embedViaOpenAICompatible(ctx, base+"/v1/embeddings", model, inputs)
+	case localEmbedOpenAIPlain:
+		return c.embedViaOpenAICompatible(ctx, base+"/embeddings", model, inputs)
+	case localEmbedLlamaNative:
+		return c.embedViaLlamaCppNative(ctx, base, inputs)
+	default:
+		return nil, fmt.Errorf("unknown local embed style %q", style)
+	}
+}
+
+// embedViaOllamaAPI calls Ollama private POST /api/embed.
+func (c *Client) embedViaOllamaAPI(ctx context.Context, base, model string, inputs []string) ([][]float64, error) {
+	payload := map[string]any{
+		"model":      model,
+		"input":      inputs,
+		"keep_alive": "30s",
+	}
+	var resp struct {
+		Embeddings [][]float64 `json:"embeddings"`
+		Embedding  []float64   `json:"embedding"`
+		Error      string      `json:"error"`
+		Data       []struct {
+			Embedding []float64 `json:"embedding"`
+			Index     int       `json:"index"`
+		} `json:"data"`
+	}
+	if err := c.doJSONNoAuth(ctx, base+"/api/embed", payload, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Error != "" {
+		return nil, fmt.Errorf("ollama embedding error: %s", resp.Error)
+	}
+	return normalizeEmbeddingResponse(resp.Embeddings, resp.Embedding, resp.Data, len(inputs))
+}
+
+// embedViaOpenAICompatible calls OpenAI-style embeddings (llama.cpp server, vLLM, etc.).
+func (c *Client) embedViaOpenAICompatible(ctx context.Context, url, model string, inputs []string) ([][]float64, error) {
+	payload := map[string]any{
+		"input": inputs,
+	}
+	if strings.TrimSpace(model) != "" {
+		payload["model"] = model
+	}
+	var resp struct {
+		Data []struct {
+			Embedding []float64 `json:"embedding"`
+			Index     int       `json:"index"`
+		} `json:"data"`
+		Error any `json:"error"`
+	}
+	if err := c.doJSONNoAuth(ctx, url, payload, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Error != nil {
+		return nil, fmt.Errorf("openai-compatible embedding error: %v", resp.Error)
+	}
+	return normalizeEmbeddingResponse(nil, nil, resp.Data, len(inputs))
+}
+
+// embedViaLlamaCppNative uses llama-server native POST /embedding {"content":"..."}.
+// One request per input (endpoint is single-text).
+func (c *Client) embedViaLlamaCppNative(ctx context.Context, base string, inputs []string) ([][]float64, error) {
+	out := make([][]float64, 0, len(inputs))
+	for _, text := range inputs {
+		payload := map[string]any{"content": text}
+		// Some builds also accept "input"; include both for robustness.
+		payload["input"] = text
+		var resp struct {
+			Embedding  []float64   `json:"embedding"`
+			Embeddings [][]float64 `json:"embeddings"`
+			Data       []struct {
+				Embedding []float64 `json:"embedding"`
+				Index     int       `json:"index"`
+			} `json:"data"`
+			Error any `json:"error"`
+		}
+		if err := c.doJSONNoAuth(ctx, base+"/embedding", payload, &resp); err != nil {
+			// Alternate path used by some llama.cpp builds.
+			if err2 := c.doJSONNoAuth(ctx, base+"/embeddings", payload, &resp); err2 != nil {
+				return nil, err
+			}
+		}
+		if resp.Error != nil {
+			return nil, fmt.Errorf("llamacpp embedding error: %v", resp.Error)
+		}
+		vecs, err := normalizeEmbeddingResponse(resp.Embeddings, resp.Embedding, resp.Data, 1)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, vecs[0])
 	}
 	return out, nil
 }
@@ -224,19 +385,31 @@ func normalizeEmbeddingResponse(embeddings [][]float64, embedding []float64, dat
 	}
 	if len(data) > 0 {
 		out := make([][]float64, count)
+		filled := 0
 		for _, item := range data {
-			if item.Index >= 0 && item.Index < len(out) {
+			if item.Index >= 0 && item.Index < len(out) && len(item.Embedding) > 0 {
 				out[item.Index] = item.Embedding
+				filled++
 			}
+		}
+		// Some servers return data without index (sequential order).
+		if filled == 0 && len(data) == count {
+			for i, item := range data {
+				if len(item.Embedding) == 0 {
+					return nil, fmt.Errorf("local embedding missing vector at index %d", i)
+				}
+				out[i] = item.Embedding
+			}
+			return out, nil
 		}
 		for i := range out {
 			if len(out[i]) == 0 {
-				return nil, fmt.Errorf("ollama embedding missing vector at index %d", i)
+				return nil, fmt.Errorf("local embedding missing vector at index %d", i)
 			}
 		}
 		return out, nil
 	}
-	return nil, fmt.Errorf("ollama embedding returned %d vectors for %d inputs", len(embeddings), count)
+	return nil, fmt.Errorf("local embedding returned %d vectors for %d inputs", len(embeddings), count)
 }
 
 type RerankItem struct {
@@ -641,6 +814,10 @@ func (c *Client) unloadOllamaModel(ctx context.Context, base, model string) {
 	}
 	if base = strings.TrimRight(strings.TrimSpace(base), "/"); base == "" {
 		base = conf.DefaultOllamaBaseURL
+	}
+	// Only Ollama understands keep_alive unload; skip for llama.cpp / OpenAI-compatible styles.
+	if style, ok := c.getLocalEmbedStyle(base); ok && style != localEmbedOllamaAPI {
+		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()

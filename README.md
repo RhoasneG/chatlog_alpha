@@ -16,6 +16,8 @@
 - 解密链路改为 SQLCipher4：`PBKDF2-HMAC-SHA512`（256000 轮）派生后 AES-CBC 解页。
 - 新增 CLI：`chatlog key`；TUI「重启并获取密钥」走同一 Frida 路径。
 - 当前文档标注可运行微信版本为 **Mac 版 4.1.11.54**。
+- 本地 Embedding 兼容 **llama.cpp server**：`embedding_provider=ollama` 时自动探测  
+  `/api/embed` → `/v1/embeddings` → `/embeddings` → `/embedding`；可将 `ollama_base_url` 指到 `llama-server --embeddings`，无需 Ollama。
 
 ### 2026-04-26
 
@@ -343,7 +345,7 @@ ls -l "$BIN_PATH"   # 期望看到 -rwsr-xr-x
 - `GET /api/v1/db/query`
 - `POST /api/v1/cache/clear`
 
-语义检索（Ollama Embedding + Rerank，GLM/DeepSeek Chat 可选）：
+语义检索（本地 Embedding：Ollama 或 llama.cpp；Rerank/Chat 可选）：
 
 - `GET /api/v1/semantic/config`
 - `POST /api/v1/semantic/config`
@@ -466,37 +468,78 @@ YAML 可读性优化：
 - 语义索引覆盖卡片会显示 `检测中 / 未启用 / 构建中 / 未建立 / 已索引条数 / 不可用`，避免接口异常或索引为空时表现为空白。
 - 分组统计（私聊/群聊独立分析）使用各面板的 `since` 参数过滤，默认"近 7 天"。
 
-## 实验性语义能力（Ollama Embedding/Rerank + 可选 GLM/DeepSeek Chat）
+## 实验性语义能力（本地 Embedding + 可选 Rerank/Chat）
 
 前端入口：
 
-- 根页面 `http://127.0.0.1:5030/` 的“实验性功能”标签页现在是 GPT 网页端式聊天入口。
-- 右侧可设置时间窗、最近会话数量、指定单个 chat、勾选多个最近会话和检索深度作为数据源/检索策略。
-- 时间窗是默认范围；如果问题中包含“今天/昨天/4月23日/2026-04-23/近一月/历史”等明确时间表达，后端会自动覆盖默认时间窗。
-- 对话框下方的“配置与索引管理”二级面板中提供模型参数、连通性测试、索引状态、删除索引、重建索引（断点续传）和主题/画像工具。
+- 根页面 `http://127.0.0.1:5030/` 的“实验性功能”标签页是 GPT 网页端式聊天入口。
+- 右侧可设置时间窗、最近会话数量、指定单个 chat、勾选多个最近会话和检索深度。
+- 时间窗是默认范围；问题中含“今天/昨天/4月23日/2026-04-23/近一月/历史”等表达时，后端会自动覆盖默认时间窗。
+- 对话框下方的“配置与索引管理”提供模型参数、连通性测试、索引状态、删除/重建索引和主题/画像工具。
 
-配置与测试：
+### 默认配置
 
-- 支持配置 `ollama_base_url`、`embedding_provider`、`rerank_provider`、`chat_provider`、`api_key`、`base_url`、`deepseek_api_key`、`deepseek_base_url`、`embedding_model`、`rerank_model`、`chat_model`、`chat_max_tokens`、`chat_temperature`、`embedding_dimension`、`recall_k`、`top_n`、`similarity_threshold`。
-- 支持配置 `index_workers`（并发索引线程数，默认 1，最大 32）。
-- 语义能力属于实验性固定能力（前端不可关闭）；`POST /api/v1/semantic/test` 仅做当前表单配置的临时连通性测试，不保存配置、不启动索引、不改变功能状态。Embedding 未配置或不可连接时，索引、检索和问答禁止启动。
-- Ollama 默认地址为 `http://127.0.0.1:11434`，默认使用 `qwen3-embedding:8b` 和 `dengcao/Qwen3-Reranker-8B:Q5_K_M`。
-- 本地 Ollama 模型采用串行调度：同一时间只运行一个 Ollama 模型，避免 embedding、rerank、chat 同时占用内存/显存；同一阶段会复用已加载模型，阶段切换、任务结束或连通性测试结束后主动释放。代价是切换 embedding/rerank/chat 阶段时会有冷启动开销。
-- 性能提示：`qwen3-embedding:8b`、8B 级 rerank/chat 模型对内存和 CPU/GPU 压力较高，16GB 内存机器建议保持 `index_workers=1`，必要时改用 `qwen3-embedding:4b` 或更小模型；Ollama 场景调高并发通常不会线性加速，反而可能增加排队、换模和内存压力。
-- 费用提示：GLM、DeepSeek 等远程 API 会按模型、输入 token、输出 token 和请求量计费。重建向量索引、开启 LLM Chunk 摘要、时间知识图谱抽取/校验、热点摘要、主题画像和会话问答都可能产生大量请求；建议先用小时间窗/少量会话测试，再进行全量重建或高并发抽取。
-- `api_key` 仅用于 GLM Chat 或 GLM provider，`deepseek_api_key` 仅用于 DeepSeek Chat；两者均无默认值，配置接口不回显真实 key，仅返回 `has_api_key` / `has_deepseek_api_key` 标记。
-- `POST /api/v1/semantic/config` 时若 `api_key` 留空，将保留已保存 key（不会清空）。
-- 默认模型：
-  - embedding provider：`ollama`
-  - embedding：`qwen3-embedding:8b`
-  - rerank provider：`ollama`
-  - rerank：`dengcao/Qwen3-Reranker-8B:Q5_K_M`
-  - chat provider：`glm`
-  - chat：`glm-5.1`（可选；未配置 GLM API Key 时，会话问答、LLM 摘要、时间知识图谱抽取不可用）
-- DeepSeek Chat 可选配置：`chat_provider=deepseek`，默认 `deepseek_base_url=https://api.deepseek.com`，默认模型 `deepseek-chat`；也可手动改为 `deepseek-reasoner`。
-- 默认向量维度为 `4096`，与 `qwen3-embedding:8b` 的 Ollama 输出保持一致；`qwen3-embedding:4b` 会自动识别为 `2560` 维。维度或 embedding 模型变更后需要重建向量索引。
-- Embedding 请求限制：单次数组最多 64 条；单条输入最多约 3072 tokens，服务端会按该上限做近似截断并自动拆批。
-- `chat_model` 默认通过 GLM Chat Completions 调用，请求路径为 `<base_url>/chat/completions`；如选择 DeepSeek，则请求 `<deepseek_base_url>/chat/completions`；如选择 Ollama Chat，则请求 `<ollama_base_url>/api/chat`。
+| 项 | 默认值 |
+|----|--------|
+| Embedding provider | `ollama`（本地槽位：Ollama **或** llama.cpp 等兼容服务） |
+| Embedding model | `qwen3-embedding:8b`（Ollama 场景） |
+| Embedding 维度 | `4096`（`qwen3-embedding:4b` 自动 `2560`） |
+| 本地 Base URL（`ollama_base_url`） | `http://127.0.0.1:11434` |
+| Rerank provider | `ollama`（默认模型 `dengcao/Qwen3-Reranker-8B:Q5_K_M`） |
+| Chat provider | `glm`（默认 `glm-5.1`，需 API Key；可选 DeepSeek / Ollama Chat） |
+
+可配置字段：`ollama_base_url`、`embedding_provider`、`rerank_provider`、`chat_provider`、`api_key`、`base_url`、`deepseek_api_key`、`deepseek_base_url`、`embedding_model`、`rerank_model`、`chat_model`、`chat_max_tokens`、`chat_temperature`、`embedding_dimension`、`recall_k`、`top_n`、`similarity_threshold`、`index_workers`（默认 1，最大 32）。
+
+语义能力为实验性固定能力（前端不可关）。`POST /api/v1/semantic/test` 仅做当前表单的临时连通性测试，不保存配置、不启动索引。Embedding 未配置或不可连接时，禁止索引/检索/问答。
+
+### 本地 Embedding：Ollama 与 llama.cpp
+
+`embedding_provider=ollama` 表示「本地 embedding 槽位」，**不强制必须是 Ollama 进程**。请求会按顺序探测：
+
+| 顺序 | 路径 | 说明 |
+|------|------|------|
+| 1 | `POST {base}/api/embed` | Ollama 私有接口 |
+| 2 | `POST {base}/v1/embeddings` | OpenAI 兼容（**llama-server** 推荐） |
+| 3 | `POST {base}/embeddings` | 部分兼容服务 |
+| 4 | `POST {base}/embedding` | llama.cpp 原生（`content` 字段，单条） |
+
+首次成功的协议会按 Base URL 缓存，避免每批重复探测。
+
+**Ollama（默认）**
+
+```bash
+# 安装并拉取 embedding 模型后保持默认 ollama_base_url=http://127.0.0.1:11434 即可
+ollama pull qwen3-embedding:8b
+```
+
+**llama.cpp server（无需 Ollama）**
+
+```bash
+# 启动时必须打开 embeddings
+llama-server -m /path/to/your-embed.gguf --embeddings -c 512 --port 8080
+```
+
+在「配置与索引管理」中：
+
+1. Embedding Provider 保持 `ollama`（本地槽位）  
+2. **Ollama Base URL** 改为 `http://127.0.0.1:8080`（你的 llama-server 地址）  
+3. Embedding Model 填任意非空名（部分服务会忽略 model 字段）  
+4. **Embedding Dimension** 改成与 GGUF 模型一致的维度  
+5. 点「连通性测试」确认  
+
+> Rerank / Chat 若仍选 `ollama`，会走 Ollama 的 `/api/generate`、`/api/chat`，**llama.cpp 默认不兼容**。  
+> 纯 llama.cpp 时建议：关闭 Rerank，或 Rerank/Chat 改用 GLM/DeepSeek；Chat 也可继续用远程 API。
+
+本地多模型串行调度（主要为 Ollama 换模）：同一时间只跑一个本地模型阶段（embedding / rerank / chat），阶段切换会卸载模型。对 llama.cpp 不会发 Ollama 的 `keep_alive` 卸载请求。
+
+### 其他说明
+
+- Embedding 限制：单次最多 64 条；单条约 3072 tokens 上限，服务端自动截断拆批。
+- 维度或 embedding 模型变更后需**重建向量索引**。
+- 性能：8B 级本地模型对内存/CPU/GPU 压力大，16GB 机器建议 `index_workers=1`；可改用更小 embedding 模型。
+- 费用：GLM/DeepSeek 按 token 计费；全量重建、LLM Chunk、图谱抽取、热点摘要等可能产生大量请求，建议先小范围试跑。
+- `api_key` / `deepseek_api_key` 无默认值，接口不回显真实 key，仅 `has_api_key` / `has_deepseek_api_key`；保存时留空表示保留已存 key。
+- Chat 路径：GLM → `<base_url>/chat/completions`；DeepSeek → `<deepseek_base_url>/chat/completions`；Ollama Chat → `<ollama_base_url>/api/chat`。
 
 ## 时间知识图谱
 
